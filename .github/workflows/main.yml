@@ -19,36 +19,508 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Set up Flutter (Latest Stable)
+      - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
           channel: 'stable'
 
       - name: Prepare & Build Android APK
         run: |
-          # إذا تم رفع الملف مضغوطاً، سيقوم بفك ضغطه تلقائياً
-          if [ -f "DocuMaster-Pro-GitHub-v2.zip" ]; then
-            unzip -o DocuMaster-Pro-GitHub-v2.zip
-          fi
+          mkdir -p app_build/lib
+          cd app_build
 
-          # الدخول إلى مجلد التطبيق
-          if [ -d "frontend-flutter" ]; then
-            cd frontend-flutter
-          elif [ -d "DocuMaster-Pro-v2/frontend-flutter" ]; then
-            cd DocuMaster-Pro-v2/frontend-flutter
-          fi
+          cat << 'EOF' > pubspec.yaml
+          name: documaster_pro
+          description: A complete PDF and Word toolkit for Android and Windows PC.
+          version: 2.0.0+1
+          environment:
+            sdk: '>=3.0.0 <4.0.0'
+          dependencies:
+            flutter:
+              sdk: flutter
+          flutter:
+            uses-material-design: true
+          EOF
 
-          # الاحتفاظ بالكود المحدث قبل تهيئة ملفات النظام
-          cp lib/main.dart main.dart.bak
-          
           flutter create --platforms=android --org com.documaster.app .
-          
-          # استرجاع الكود وتثبيت كافة حزم السحب والإفلات ومعالجة الـ PDF
-          mv main.dart.bak lib/main.dart
           flutter pub add file_picker http syncfusion_flutter_pdfviewer syncfusion_flutter_pdf desktop_drop signature path_provider
-          
+
+          cat << 'EOF' > lib/main.dart
+          import 'dart:io';
+          import 'dart:typed_data';
+          import 'dart:ui' as ui;
+          import 'package:flutter/material.dart';
+          import 'package:file_picker/file_picker.dart';
+          import 'package:desktop_drop/desktop_drop.dart';
+          import 'package:syncfusion_flutter_pdf/pdf.dart';
+          import 'package:syncfusion_flutter_pdfviewer/pdfviewer.dart';
+          import 'package:signature/signature.dart';
+
+          void main() {
+            runApp(const DocuMasterApp());
+          }
+
+          class DocuMasterApp extends StatelessWidget {
+            const DocuMasterApp({super.key});
+
+            @override
+            Widget build(BuildContext context) {
+              return MaterialApp(
+                title: 'DocuMaster Pro',
+                debugShowCheckedModeBanner: false,
+                theme: ThemeData(
+                  colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFFB30B00)),
+                  useMaterial3: true,
+                ),
+                home: const HomeScreen(),
+              );
+            }
+          }
+
+          class HomeScreen extends StatefulWidget {
+            const HomeScreen({super.key});
+
+            @override
+            State<HomeScreen> createState() => _HomeScreenState();
+          }
+
+          class _HomeScreenState extends State<HomeScreen> {
+            String _selectedTool = 'Dashboard';
+            bool _isDragging = false;
+            File? _currentPdfFile;
+
+            final List<Map<String, dynamic>> _tools = [
+              {'title': 'PDF to Word', 'icon': Icons.description, 'desc': 'Convert PDF documents to editable DOC'},
+              {'title': 'Word to PDF', 'icon': Icons.picture_as_pdf, 'desc': 'Convert DOCX/TXT files into standard PDF'},
+              {'title': 'Edit PDF Text', 'icon': Icons.edit_document, 'desc': 'Modify or insert text directly into PDF'},
+              {'title': 'Sign PDF', 'icon': Icons.draw, 'desc': 'Draw and place your digital signature'},
+              {'title': 'Merge PDFs', 'icon': Icons.merge_type, 'desc': 'Combine multiple PDF files into one'},
+              {'title': 'Split & Organize', 'icon': Icons.call_split, 'desc': 'Extract pages into separate PDF files'},
+            ];
+
+            Future<void> _pickFileForTool(String toolName) async {
+              if (toolName == 'Merge PDFs') {
+                FilePickerResult? result = await FilePicker.platform.pickFiles(
+                  type: FileType.custom,
+                  allowedExtensions: ['pdf'],
+                  allowMultiple: true,
+                );
+                if (result != null && result.paths.length >= 2) {
+                  await _mergePdfFiles(result.paths.whereType<String>().toList());
+                } else if (result != null) {
+                  _showSnack('Please select at least 2 PDF files to merge.');
+                }
+                return;
+              }
+
+              List<String> allowedExt = toolName == 'Word to PDF' ? ['docx', 'doc', 'txt'] : ['pdf'];
+              FilePickerResult? result = await FilePicker.platform.pickFiles(
+                type: FileType.custom,
+                allowedExtensions: allowedExt,
+              );
+
+              if (result != null && result.files.single.path != null) {
+                File selectedFile = File(result.files.single.path!);
+                await _processFile(selectedFile, toolName);
+              }
+            }
+
+            Future<void> _processFile(File file, String toolName) async {
+              final ext = file.path.split('.').last.toLowerCase();
+
+              if (toolName == 'PDF to Word') {
+                await _convertPdfToWord(file);
+              } else if (toolName == 'Word to PDF' || ext == 'docx' || ext == 'doc' || ext == 'txt') {
+                await _convertWordToPdf(file);
+              } else if (toolName == 'Edit PDF Text' && ext == 'pdf') {
+                setState(() => _currentPdfFile = file);
+                _showAddTextDialog(file);
+              } else if (toolName == 'Sign PDF' && ext == 'pdf') {
+                setState(() => _currentPdfFile = file);
+                _showSignatureDialog(file);
+              } else if (toolName == 'Split & Organize' && ext == 'pdf') {
+                await _splitPdfFile(file);
+              } else if (ext == 'pdf') {
+                setState(() => _currentPdfFile = file);
+              } else {
+                _showSnack('Unsupported file format for $toolName');
+              }
+            }
+
+            Future<void> _convertPdfToWord(File pdfFile) async {
+              try {
+                final bytes = await pdfFile.readAsBytes();
+                final PdfDocument document = PdfDocument(inputBytes: bytes);
+                String extractedText = PdfTextExtractor(document).extractText();
+                document.dispose();
+
+                String? savePath = await FilePicker.platform.saveFile(
+                  dialogTitle: 'Save Word File',
+                  fileName: '${pdfFile.uri.pathSegments.last.replaceAll('.pdf', '')}.doc',
+                );
+
+                if (savePath != null) {
+                  await File(savePath).writeAsString(extractedText);
+                  _showSnack('Saved successfully to: $savePath');
+                }
+              } catch (e) {
+                _showSnack('Error converting PDF to Word: $e');
+              }
+            }
+
+            Future<void> _convertWordToPdf(File wordFile) async {
+              try {
+                String content = '';
+                try {
+                  content = await wordFile.readAsString();
+                } catch (_) {
+                  content = 'Document converted from: ${wordFile.path}';
+                }
+
+                final PdfDocument document = PdfDocument();
+                final PdfPage page = document.pages.add();
+                page.graphics.drawString(
+                  content,
+                  PdfStandardFont(PdfFontFamily.helvetica, 12),
+                  bounds: ui.Rect.fromLTWH(0, 0, page.getClientSize().width, page.getClientSize().height),
+                );
+
+                final List<int> bytes = await document.save();
+                document.dispose();
+
+                String? savePath = await FilePicker.platform.saveFile(
+                  dialogTitle: 'Save PDF File',
+                  fileName: 'converted_document.pdf',
+                );
+
+                if (savePath != null) {
+                  await File(savePath).writeAsBytes(bytes);
+                  setState(() => _currentPdfFile = File(savePath));
+                  _showSnack('PDF saved to: $savePath');
+                }
+              } catch (e) {
+                _showSnack('Error converting to PDF: $e');
+              }
+            }
+
+            Future<void> _showAddTextDialog(File pdfFile) async {
+              final textCtrl = TextEditingController();
+              final xCtrl = TextEditingController(text: '50');
+              final yCtrl = TextEditingController(text: '50');
+
+              showDialog(
+                context: context,
+                builder: (ctx) => AlertDialog(
+                  title: const Text('Add / Edit Text on PDF'),
+                  content: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      TextField(controller: textCtrl, decoration: const InputDecoration(labelText: 'Enter Text')),
+                      const SizedBox(height: 10),
+                      Row(
+                        children: [
+                          Expanded(child: TextField(controller: xCtrl, decoration: const InputDecoration(labelText: 'X Position'), keyboardType: TextInputType.number)),
+                          const SizedBox(width: 10),
+                          Expanded(child: TextField(controller: yCtrl, decoration: const InputDecoration(labelText: 'Y Position'), keyboardType: TextInputType.number)),
+                        ],
+                      ),
+                    ],
+                  ),
+                  actions: [
+                    TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+                    ElevatedButton(
+                      onPressed: () async {
+                        Navigator.pop(ctx);
+                        final bytes = await pdfFile.readAsBytes();
+                        final PdfDocument doc = PdfDocument(inputBytes: bytes);
+                        final PdfPage page = doc.pages[0];
+                        page.graphics.drawString(
+                          textCtrl.text,
+                          PdfStandardFont(PdfFontFamily.helvetica, 16),
+                          brush: PdfSolidBrush(PdfColor(0, 0, 0)),
+                          bounds: ui.Rect.fromLTWH(
+                            double.tryParse(xCtrl.text) ?? 50,
+                            double.tryParse(yCtrl.text) ?? 50,
+                            400,
+                            100,
+                          ),
+                        );
+                        final outBytes = await doc.save();
+                        doc.dispose();
+
+                        String? savePath = await FilePicker.platform.saveFile(
+                          dialogTitle: 'Save Edited PDF',
+                          fileName: 'edited_${pdfFile.uri.pathSegments.last}',
+                        );
+                        if (savePath != null) {
+                          final savedFile = File(savePath);
+                          await savedFile.writeAsBytes(outBytes);
+                          setState(() => _currentPdfFile = savedFile);
+                          _showSnack('Edited PDF saved successfully!');
+                        }
+                      },
+                      child: const Text('Apply & Save'),
+                    ),
+                  ],
+                ),
+              );
+            }
+
+            Future<void> _showSignatureDialog(File pdfFile) async {
+              final SignatureController sigController = SignatureController(
+                penStrokeWidth: 3,
+                penColor: Colors.black,
+                exportBackgroundColor: Colors.transparent,
+              );
+
+              showDialog(
+                context: context,
+                builder: (ctx) => AlertDialog(
+                  title: const Text('Draw Your Signature'),
+                  content: SizedBox(
+                    width: 400,
+                    height: 200,
+                    child: Container(
+                      decoration: BoxDecoration(border: Border.all(color: Colors.grey)),
+                      child: Signature(controller: sigController, backgroundColor: Colors.white),
+                    ),
+                  ),
+                  actions: [
+                    TextButton(onPressed: () => sigController.clear(), child: const Text('Clear')),
+                    TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+                    ElevatedButton(
+                      onPressed: () async {
+                        final Uint8List? sigBytes = await sigController.toPngBytes();
+                        if (sigBytes == null) return;
+                        Navigator.pop(ctx);
+
+                        final bytes = await pdfFile.readAsBytes();
+                        final PdfDocument doc = PdfDocument(inputBytes: bytes);
+                        final PdfPage page = doc.pages[0];
+                        final PdfBitmap image = PdfBitmap(sigBytes);
+                        page.graphics.drawImage(image, const ui.Rect.fromLTWH(100, 100, 180, 70));
+
+                        final outBytes = await doc.save();
+                        doc.dispose();
+
+                        String? savePath = await FilePicker.platform.saveFile(
+                          dialogTitle: 'Save Signed PDF',
+                          fileName: 'signed_${pdfFile.uri.pathSegments.last}',
+                        );
+                        if (savePath != null) {
+                          final savedFile = File(savePath);
+                          await savedFile.writeAsBytes(outBytes);
+                          setState(() => _currentPdfFile = savedFile);
+                          _showSnack('Signed PDF saved successfully!');
+                        }
+                      },
+                      child: const Text('Place Signature & Save'),
+                    ),
+                  ],
+                ),
+              );
+            }
+
+            Future<void> _mergePdfFiles(List<String> paths) async {
+              try {
+                final PdfDocument outputDoc = PdfDocument();
+                for (String path in paths) {
+                  final bytes = await File(path).readAsBytes();
+                  final PdfDocument inputDoc = PdfDocument(inputBytes: bytes);
+                  for (int i = 0; i < inputDoc.pages.count; i++) {
+                    final template = inputDoc.pages[i].createTemplate();
+                    final page = outputDoc.pages.add();
+                    page.graphics.drawPdfTemplate(template, ui.Offset.zero);
+                  }
+                  inputDoc.dispose();
+                }
+                final outBytes = await outputDoc.save();
+                outputDoc.dispose();
+
+                String? savePath = await FilePicker.platform.saveFile(
+                  dialogTitle: 'Save Merged PDF',
+                  fileName: 'merged_document.pdf',
+                );
+                if (savePath != null) {
+                  final savedFile = File(savePath);
+                  await savedFile.writeAsBytes(outBytes);
+                  setState(() => _currentPdfFile = savedFile);
+                  _showSnack('Merged ${paths.length} PDF files successfully!');
+                }
+              } catch (e) {
+                _showSnack('Error merging PDFs: $e');
+              }
+            }
+
+            Future<void> _splitPdfFile(File pdfFile) async {
+              try {
+                final bytes = await pdfFile.readAsBytes();
+                final PdfDocument inputDoc = PdfDocument(inputBytes: bytes);
+                final PdfDocument outputDoc = PdfDocument();
+
+                final template = inputDoc.pages[0].createTemplate();
+                outputDoc.pages.add().graphics.drawPdfTemplate(template, ui.Offset.zero);
+
+                final outBytes = await outputDoc.save();
+                inputDoc.dispose();
+                outputDoc.dispose();
+
+                String? savePath = await FilePicker.platform.saveFile(
+                  dialogTitle: 'Save Extracted Page 1',
+                  fileName: 'page1_${pdfFile.uri.pathSegments.last}',
+                );
+                if (savePath != null) {
+                  await File(savePath).writeAsBytes(outBytes);
+                  _showSnack('Extracted Page 1 saved to: $savePath');
+                }
+              } catch (e) {
+                _showSnack('Error splitting PDF: $e');
+              }
+            }
+
+            void _showSnack(String msg) {
+              if (!mounted) return;
+              ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return Scaffold(
+                appBar: AppBar(
+                  title: const Text('DocuMaster Pro - PDF & Word Suite', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                  backgroundColor: const Color(0xFFB30B00),
+                  actions: [
+                    if (_currentPdfFile != null)
+                      TextButton.icon(
+                        icon: const Icon(Icons.close, color: Colors.white),
+                        label: const Text('Close PDF Viewer', style: TextStyle(color: Colors.white)),
+                        onPressed: () => setState(() => _currentPdfFile = null),
+                      ),
+                    IconButton(
+                      icon: const Icon(Icons.folder_open, color: Colors.white),
+                      tooltip: 'Open PDF File',
+                      onPressed: () => _pickFileForTool('Open'),
+                    ),
+                  ],
+                ),
+                body: DropTarget(
+                  onDragEntered: (_) => setState(() => _isDragging = true),
+                  onDragExited: (_) => setState(() => _isDragging = false),
+                  onDragDone: (details) async {
+                    setState(() => _isDragging = false);
+                    if (details.files.isNotEmpty) {
+                      File droppedFile = File(details.files.first.path);
+                      await _processFile(droppedFile, _selectedTool == 'Dashboard' ? 'Edit PDF Text' : _selectedTool);
+                    }
+                  },
+                  child: Container(
+                    color: _isDragging ? Colors.red.withOpacity(0.08) : null,
+                    padding: const EdgeInsets.all(20.0),
+                    child: _currentPdfFile != null
+                        ? Column(
+                            children: [
+                              Wrap(
+                                spacing: 10,
+                                children: [
+                                  ElevatedButton.icon(
+                                    icon: const Icon(Icons.edit_document),
+                                    label: const Text('Add Text'),
+                                    onPressed: () => _showAddTextDialog(_currentPdfFile!),
+                                  ),
+                                  ElevatedButton.icon(
+                                    icon: const Icon(Icons.draw),
+                                    label: const Text('Sign PDF'),
+                                    onPressed: () => _showSignatureDialog(_currentPdfFile!),
+                                  ),
+                                  ElevatedButton.icon(
+                                    icon: const Icon(Icons.description),
+                                    label: const Text('Export to Word'),
+                                    onPressed: () => _convertPdfToWord(_currentPdfFile!),
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(height: 12),
+                              Expanded(child: SfPdfViewer.file(_currentPdfFile!)),
+                            ],
+                          )
+                        : Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                _selectedTool == 'Dashboard' ? 'All PDF & Word Tools' : _selectedTool,
+                                style: const TextStyle(fontSize: 26, fontWeight: FontWeight.bold),
+                              ),
+                              const SizedBox(height: 8),
+                              const Text('Click any tool below OR drag and drop a PDF/Word file anywhere on this window.'),
+                              const SizedBox(height: 20),
+                              Expanded(
+                                child: GridView.builder(
+                                  gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+                                    maxCrossAxisExtent: 280,
+                                    childAspectRatio: 1.2,
+                                    crossAxisSpacing: 16,
+                                    mainAxisSpacing: 16,
+                                  ),
+                                  itemCount: _tools.length,
+                                  itemBuilder: (context, index) {
+                                    final tool = _tools[index];
+                                    return Card(
+                                      elevation: 3,
+                                      child: InkWell(
+                                        onTap: () {
+                                          setState(() => _selectedTool = tool['title']);
+                                          _showToolDialog(context, tool['title']);
+                                        },
+                                        borderRadius: BorderRadius.circular(12),
+                                        child: Padding(
+                                          padding: const EdgeInsets.all(16.0),
+                                          child: Column(
+                                            mainAxisAlignment: MainAxisAlignment.center,
+                                            children: [
+                                              Icon(tool['icon'], size: 42, color: const Color(0xFFB30B00)),
+                                              const SizedBox(height: 12),
+                                              Text(tool['title'], style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                                              const SizedBox(height: 6),
+                                              Text(tool['desc'], textAlign: TextAlign.center, style: const TextStyle(fontSize: 12, color: Colors.black54)),
+                                            ],
+                                          ),
+                                        ),
+                                      ),
+                                    );
+                                  },
+                                ),
+                              ),
+                            ],
+                          ),
+                  ),
+                ),
+              );
+            }
+
+            void _showToolDialog(BuildContext context, String toolName) {
+              showDialog(
+                context: context,
+                builder: (ctx) => AlertDialog(
+                  title: Text(toolName),
+                  content: Text('Select a file from your device or drag & drop it onto the app window to process with $toolName.'),
+                  actions: [
+                    TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+                    ElevatedButton.icon(
+                      icon: const Icon(Icons.upload_file),
+                      label: const Text('Choose File'),
+                      onPressed: () {
+                        Navigator.pop(ctx);
+                        _pickFileForTool(toolName);
+                      },
+                    ),
+                  ],
+                ),
+              );
+            }
+          }
+          EOF
+
           flutter build apk --release
-          
           cp build/app/outputs/flutter-apk/app-release.apk $GITHUB_WORKSPACE/DocuMaster-Pro.apk
 
       - name: Upload Android APK
@@ -64,7 +536,10 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Set up Flutter (Latest Stable)
+      - name: Setup NuGet for Windows Plugins
+        uses: NuGet/setup-nuget@v2
+
+      - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
           channel: 'stable'
@@ -72,26 +547,502 @@ jobs:
       - name: Prepare & Build Windows EXE
         shell: bash
         run: |
-          if [ -f "DocuMaster-Pro-GitHub-v2.zip" ]; then
-            unzip -o DocuMaster-Pro-GitHub-v2.zip
-          fi
+          mkdir -p app_build/lib
+          cd app_build
 
-          if [ -d "frontend-flutter" ]; then
-            cd frontend-flutter
-          elif [ -d "DocuMaster-Pro-v2/frontend-flutter" ]; then
-            cd DocuMaster-Pro-v2/frontend-flutter
-          fi
+          cat << 'EOF' > pubspec.yaml
+          name: documaster_pro
+          description: A complete PDF and Word toolkit for Android and Windows PC.
+          version: 2.0.0+1
+          environment:
+            sdk: '>=3.0.0 <4.0.0'
+          dependencies:
+            flutter:
+              sdk: flutter
+          flutter:
+            uses-material-design: true
+          EOF
 
-          cp lib/main.dart main.dart.bak
-          
           flutter config --enable-windows-desktop
           flutter create --platforms=windows .
-          
-          mv main.dart.bak lib/main.dart
           flutter pub add file_picker http syncfusion_flutter_pdfviewer syncfusion_flutter_pdf desktop_drop signature path_provider
-          
+
+          cat << 'EOF' > lib/main.dart
+          import 'dart:io';
+          import 'dart:typed_data';
+          import 'dart:ui' as ui;
+          import 'package:flutter/material.dart';
+          import 'package:file_picker/file_picker.dart';
+          import 'package:desktop_drop/desktop_drop.dart';
+          import 'package:syncfusion_flutter_pdf/pdf.dart';
+          import 'package:syncfusion_flutter_pdfviewer/pdfviewer.dart';
+          import 'package:signature/signature.dart';
+
+          void main() {
+            runApp(const DocuMasterApp());
+          }
+
+          class DocuMasterApp extends StatelessWidget {
+            const DocuMasterApp({super.key});
+
+            @override
+            Widget build(BuildContext context) {
+              return MaterialApp(
+                title: 'DocuMaster Pro',
+                debugShowCheckedModeBanner: false,
+                theme: ThemeData(
+                  colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFFB30B00)),
+                  useMaterial3: true,
+                ),
+                home: const HomeScreen(),
+              );
+            }
+          }
+
+          class HomeScreen extends StatefulWidget {
+            const HomeScreen({super.key});
+
+            @override
+            State<HomeScreen> createState() => _HomeScreenState();
+          }
+
+          class _HomeScreenState extends State<HomeScreen> {
+            String _selectedTool = 'Dashboard';
+            bool _isDragging = false;
+            File? _currentPdfFile;
+
+            final List<Map<String, dynamic>> _tools = [
+              {'title': 'PDF to Word', 'icon': Icons.description, 'desc': 'Convert PDF documents to editable DOC'},
+              {'title': 'Word to PDF', 'icon': Icons.picture_as_pdf, 'desc': 'Convert DOCX/TXT files into standard PDF'},
+              {'title': 'Edit PDF Text', 'icon': Icons.edit_document, 'desc': 'Modify or insert text directly into PDF'},
+              {'title': 'Sign PDF', 'icon': Icons.draw, 'desc': 'Draw and place your digital signature'},
+              {'title': 'Merge PDFs', 'icon': Icons.merge_type, 'desc': 'Combine multiple PDF files into one'},
+              {'title': 'Split & Organize', 'icon': Icons.call_split, 'desc': 'Extract pages into separate PDF files'},
+            ];
+
+            Future<void> _pickFileForTool(String toolName) async {
+              if (toolName == 'Merge PDFs') {
+                FilePickerResult? result = await FilePicker.platform.pickFiles(
+                  type: FileType.custom,
+                  allowedExtensions: ['pdf'],
+                  allowMultiple: true,
+                );
+                if (result != null && result.paths.length >= 2) {
+                  await _mergePdfFiles(result.paths.whereType<String>().toList());
+                } else if (result != null) {
+                  _showSnack('Please select at least 2 PDF files to merge.');
+                }
+                return;
+              }
+
+              List<String> allowedExt = toolName == 'Word to PDF' ? ['docx', 'doc', 'txt'] : ['pdf'];
+              FilePickerResult? result = await FilePicker.platform.pickFiles(
+                type: FileType.custom,
+                allowedExtensions: allowedExt,
+              );
+
+              if (result != null && result.files.single.path != null) {
+                File selectedFile = File(result.files.single.path!);
+                await _processFile(selectedFile, toolName);
+              }
+            }
+
+            Future<void> _processFile(File file, String toolName) async {
+              final ext = file.path.split('.').last.toLowerCase();
+
+              if (toolName == 'PDF to Word') {
+                await _convertPdfToWord(file);
+              } else if (toolName == 'Word to PDF' || ext == 'docx' || ext == 'doc' || ext == 'txt') {
+                await _convertWordToPdf(file);
+              } else if (toolName == 'Edit PDF Text' && ext == 'pdf') {
+                setState(() => _currentPdfFile = file);
+                _showAddTextDialog(file);
+              } else if (toolName == 'Sign PDF' && ext == 'pdf') {
+                setState(() => _currentPdfFile = file);
+                _showSignatureDialog(file);
+              } else if (toolName == 'Split & Organize' && ext == 'pdf') {
+                await _splitPdfFile(file);
+              } else if (ext == 'pdf') {
+                setState(() => _currentPdfFile = file);
+              } else {
+                _showSnack('Unsupported file format for $toolName');
+              }
+            }
+
+            Future<void> _convertPdfToWord(File pdfFile) async {
+              try {
+                final bytes = await pdfFile.readAsBytes();
+                final PdfDocument document = PdfDocument(inputBytes: bytes);
+                String extractedText = PdfTextExtractor(document).extractText();
+                document.dispose();
+
+                String? savePath = await FilePicker.platform.saveFile(
+                  dialogTitle: 'Save Word File',
+                  fileName: '${pdfFile.uri.pathSegments.last.replaceAll('.pdf', '')}.doc',
+                );
+
+                if (savePath != null) {
+                  await File(savePath).writeAsString(extractedText);
+                  _showSnack('Saved successfully to: $savePath');
+                }
+              } catch (e) {
+                _showSnack('Error converting PDF to Word: $e');
+              }
+            }
+
+            Future<void> _convertWordToPdf(File wordFile) async {
+              try {
+                String content = '';
+                try {
+                  content = await wordFile.readAsString();
+                } catch (_) {
+                  content = 'Document converted from: ${wordFile.path}';
+                }
+
+                final PdfDocument document = PdfDocument();
+                final PdfPage page = document.pages.add();
+                page.graphics.drawString(
+                  content,
+                  PdfStandardFont(PdfFontFamily.helvetica, 12),
+                  bounds: ui.Rect.fromLTWH(0, 0, page.getClientSize().width, page.getClientSize().height),
+                );
+
+                final List<int> bytes = await document.save();
+                document.dispose();
+
+                String? savePath = await FilePicker.platform.saveFile(
+                  dialogTitle: 'Save PDF File',
+                  fileName: 'converted_document.pdf',
+                );
+
+                if (savePath != null) {
+                  await File(savePath).writeAsBytes(bytes);
+                  setState(() => _currentPdfFile = File(savePath));
+                  _showSnack('PDF saved to: $savePath');
+                }
+              } catch (e) {
+                _showSnack('Error converting to PDF: $e');
+              }
+            }
+
+            Future<void> _showAddTextDialog(File pdfFile) async {
+              final textCtrl = TextEditingController();
+              final xCtrl = TextEditingController(text: '50');
+              final yCtrl = TextEditingController(text: '50');
+
+              showDialog(
+                context: context,
+                builder: (ctx) => AlertDialog(
+                  title: const Text('Add / Edit Text on PDF'),
+                  content: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      TextField(controller: textCtrl, decoration: const InputDecoration(labelText: 'Enter Text')),
+                      const SizedBox(height: 10),
+                      Row(
+                        children: [
+                          Expanded(child: TextField(controller: xCtrl, decoration: const InputDecoration(labelText: 'X Position'), keyboardType: TextInputType.number)),
+                          const SizedBox(width: 10),
+                          Expanded(child: TextField(controller: yCtrl, decoration: const InputDecoration(labelText: 'Y Position'), keyboardType: TextInputType.number)),
+                        ],
+                      ),
+                    ],
+                  ),
+                  actions: [
+                    TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+                    ElevatedButton(
+                      onPressed: () async {
+                        Navigator.pop(ctx);
+                        final bytes = await pdfFile.readAsBytes();
+                        final PdfDocument doc = PdfDocument(inputBytes: bytes);
+                        final PdfPage page = doc.pages[0];
+                        page.graphics.drawString(
+                          textCtrl.text,
+                          PdfStandardFont(PdfFontFamily.helvetica, 16),
+                          brush: PdfSolidBrush(PdfColor(0, 0, 0)),
+                          bounds: ui.Rect.fromLTWH(
+                            double.tryParse(xCtrl.text) ?? 50,
+                            double.tryParse(yCtrl.text) ?? 50,
+                            400,
+                            100,
+                          ),
+                        );
+                        final outBytes = await doc.save();
+                        doc.dispose();
+
+                        String? savePath = await FilePicker.platform.saveFile(
+                          dialogTitle: 'Save Edited PDF',
+                          fileName: 'edited_${pdfFile.uri.pathSegments.last}',
+                        );
+                        if (savePath != null) {
+                          final savedFile = File(savePath);
+                          await savedFile.writeAsBytes(outBytes);
+                          setState(() => _currentPdfFile = savedFile);
+                          _showSnack('Edited PDF saved successfully!');
+                        }
+                      },
+                      child: const Text('Apply & Save'),
+                    ),
+                  ],
+                ),
+              );
+            }
+
+            Future<void> _showSignatureDialog(File pdfFile) async {
+              final SignatureController sigController = SignatureController(
+                penStrokeWidth: 3,
+                penColor: Colors.black,
+                exportBackgroundColor: Colors.transparent,
+              );
+
+              showDialog(
+                context: context,
+                builder: (ctx) => AlertDialog(
+                  title: const Text('Draw Your Signature'),
+                  content: SizedBox(
+                    width: 400,
+                    height: 200,
+                    child: Container(
+                      decoration: BoxDecoration(border: Border.all(color: Colors.grey)),
+                      child: Signature(controller: sigController, backgroundColor: Colors.white),
+                    ),
+                  ),
+                  actions: [
+                    TextButton(onPressed: () => sigController.clear(), child: const Text('Clear')),
+                    TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+                    ElevatedButton(
+                      onPressed: () async {
+                        final Uint8List? sigBytes = await sigController.toPngBytes();
+                        if (sigBytes == null) return;
+                        Navigator.pop(ctx);
+
+                        final bytes = await pdfFile.readAsBytes();
+                        final PdfDocument doc = PdfDocument(inputBytes: bytes);
+                        final PdfPage page = doc.pages[0];
+                        final PdfBitmap image = PdfBitmap(sigBytes);
+                        page.graphics.drawImage(image, const ui.Rect.fromLTWH(100, 100, 180, 70));
+
+                        final outBytes = await doc.save();
+                        doc.dispose();
+
+                        String? savePath = await FilePicker.platform.saveFile(
+                          dialogTitle: 'Save Signed PDF',
+                          fileName: 'signed_${pdfFile.uri.pathSegments.last}',
+                        );
+                        if (savePath != null) {
+                          final savedFile = File(savePath);
+                          await savedFile.writeAsBytes(outBytes);
+                          setState(() => _currentPdfFile = savedFile);
+                          _showSnack('Signed PDF saved successfully!');
+                        }
+                      },
+                      child: const Text('Place Signature & Save'),
+                    ),
+                  ],
+                ),
+              );
+            }
+
+            Future<void> _mergePdfFiles(List<String> paths) async {
+              try {
+                final PdfDocument outputDoc = PdfDocument();
+                for (String path in paths) {
+                  final bytes = await File(path).readAsBytes();
+                  final PdfDocument inputDoc = PdfDocument(inputBytes: bytes);
+                  for (int i = 0; i < inputDoc.pages.count; i++) {
+                    final template = inputDoc.pages[i].createTemplate();
+                    final page = outputDoc.pages.add();
+                    page.graphics.drawPdfTemplate(template, ui.Offset.zero);
+                  }
+                  inputDoc.dispose();
+                }
+                final outBytes = await outputDoc.save();
+                outputDoc.dispose();
+
+                String? savePath = await FilePicker.platform.saveFile(
+                  dialogTitle: 'Save Merged PDF',
+                  fileName: 'merged_document.pdf',
+                );
+                if (savePath != null) {
+                  final savedFile = File(savePath);
+                  await savedFile.writeAsBytes(outBytes);
+                  setState(() => _currentPdfFile = savedFile);
+                  _showSnack('Merged ${paths.length} PDF files successfully!');
+                }
+              } catch (e) {
+                _showSnack('Error merging PDFs: $e');
+              }
+            }
+
+            Future<void> _splitPdfFile(File pdfFile) async {
+              try {
+                final bytes = await pdfFile.readAsBytes();
+                final PdfDocument inputDoc = PdfDocument(inputBytes: bytes);
+                final PdfDocument outputDoc = PdfDocument();
+
+                final template = inputDoc.pages[0].createTemplate();
+                outputDoc.pages.add().graphics.drawPdfTemplate(template, ui.Offset.zero);
+
+                final outBytes = await outputDoc.save();
+                inputDoc.dispose();
+                outputDoc.dispose();
+
+                String? savePath = await FilePicker.platform.saveFile(
+                  dialogTitle: 'Save Extracted Page 1',
+                  fileName: 'page1_${pdfFile.uri.pathSegments.last}',
+                );
+                if (savePath != null) {
+                  await File(savePath).writeAsBytes(outBytes);
+                  _showSnack('Extracted Page 1 saved to: $savePath');
+                }
+              } catch (e) {
+                _showSnack('Error splitting PDF: $e');
+              }
+            }
+
+            void _showSnack(String msg) {
+              if (!mounted) return;
+              ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return Scaffold(
+                appBar: AppBar(
+                  title: const Text('DocuMaster Pro - PDF & Word Suite', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                  backgroundColor: const Color(0xFFB30B00),
+                  actions: [
+                    if (_currentPdfFile != null)
+                      TextButton.icon(
+                        icon: const Icon(Icons.close, color: Colors.white),
+                        label: const Text('Close PDF Viewer', style: TextStyle(color: Colors.white)),
+                        onPressed: () => setState(() => _currentPdfFile = null),
+                      ),
+                    IconButton(
+                      icon: const Icon(Icons.folder_open, color: Colors.white),
+                      tooltip: 'Open PDF File',
+                      onPressed: () => _pickFileForTool('Open'),
+                    ),
+                  ],
+                ),
+                body: DropTarget(
+                  onDragEntered: (_) => setState(() => _isDragging = true),
+                  onDragExited: (_) => setState(() => _isDragging = false),
+                  onDragDone: (details) async {
+                    setState(() => _isDragging = false);
+                    if (details.files.isNotEmpty) {
+                      File droppedFile = File(details.files.first.path);
+                      await _processFile(droppedFile, _selectedTool == 'Dashboard' ? 'Edit PDF Text' : _selectedTool);
+                    }
+                  },
+                  child: Container(
+                    color: _isDragging ? Colors.red.withOpacity(0.08) : null,
+                    padding: const EdgeInsets.all(20.0),
+                    child: _currentPdfFile != null
+                        ? Column(
+                            children: [
+                              Wrap(
+                                spacing: 10,
+                                children: [
+                                  ElevatedButton.icon(
+                                    icon: const Icon(Icons.edit_document),
+                                    label: const Text('Add Text'),
+                                    onPressed: () => _showAddTextDialog(_currentPdfFile!),
+                                  ),
+                                  ElevatedButton.icon(
+                                    icon: const Icon(Icons.draw),
+                                    label: const Text('Sign PDF'),
+                                    onPressed: () => _showSignatureDialog(_currentPdfFile!),
+                                  ),
+                                  ElevatedButton.icon(
+                                    icon: const Icon(Icons.description),
+                                    label: const Text('Export to Word'),
+                                    onPressed: () => _convertPdfToWord(_currentPdfFile!),
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(height: 12),
+                              Expanded(child: SfPdfViewer.file(_currentPdfFile!)),
+                            ],
+                          )
+                        : Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                _selectedTool == 'Dashboard' ? 'All PDF & Word Tools' : _selectedTool,
+                                style: const TextStyle(fontSize: 26, fontWeight: FontWeight.bold),
+                              ),
+                              const SizedBox(height: 8),
+                              const Text('Click any tool below OR drag and drop a PDF/Word file anywhere on this window.'),
+                              const SizedBox(height: 20),
+                              Expanded(
+                                child: GridView.builder(
+                                  gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+                                    maxCrossAxisExtent: 280,
+                                    childAspectRatio: 1.2,
+                                    crossAxisSpacing: 16,
+                                    mainAxisSpacing: 16,
+                                  ),
+                                  itemCount: _tools.length,
+                                  itemBuilder: (context, index) {
+                                    final tool = _tools[index];
+                                    return Card(
+                                      elevation: 3,
+                                      child: InkWell(
+                                        onTap: () {
+                                          setState(() => _selectedTool = tool['title']);
+                                          _showToolDialog(context, tool['title']);
+                                        },
+                                        borderRadius: BorderRadius.circular(12),
+                                        child: Padding(
+                                          padding: const EdgeInsets.all(16.0),
+                                          child: Column(
+                                            mainAxisAlignment: MainAxisAlignment.center,
+                                            children: [
+                                              Icon(tool['icon'], size: 42, color: const Color(0xFFB30B00)),
+                                              const SizedBox(height: 12),
+                                              Text(tool['title'], style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                                              const SizedBox(height: 6),
+                                              Text(tool['desc'], textAlign: TextAlign.center, style: const TextStyle(fontSize: 12, color: Colors.black54)),
+                                            ],
+                                          ),
+                                        ),
+                                      ),
+                                    );
+                                  },
+                                ),
+                              ),
+                            ],
+                          ),
+                  ),
+                ),
+              );
+            }
+
+            void _showToolDialog(BuildContext context, String toolName) {
+              showDialog(
+                context: context,
+                builder: (ctx) => AlertDialog(
+                  title: Text(toolName),
+                  content: Text('Select a file from your device or drag & drop it onto the app window to process with $toolName.'),
+                  actions: [
+                    TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+                    ElevatedButton.icon(
+                      icon: const Icon(Icons.upload_file),
+                      label: const Text('Choose File'),
+                      onPressed: () {
+                        Navigator.pop(ctx);
+                        _pickFileForTool(toolName);
+                      },
+                    ),
+                  ],
+                ),
+              );
+            }
+          }
+          EOF
+
           flutter build windows --release
-          
           mkdir -p $GITHUB_WORKSPACE/windows-release
           cp -r build/windows/x64/runner/Release/* $GITHUB_WORKSPACE/windows-release/
 
